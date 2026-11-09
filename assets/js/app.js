@@ -1161,10 +1161,9 @@
                 page.style.width = `${Math.max(1, width * ratio)}px`;
                 page.style.height = `${Math.max(1, height * ratio)}px`;
             });
-            requestAnimationFrame(() => {
-            viewport.scrollTop = beforeScrollTop * ratio;
-            handleScroll();
-        });
+                viewport.scrollTop = beforeScrollTop * ratio;
+                handleScroll();
+        }
 
         function closeReader() {
             const modal = document.getElementById('reader-modal');
