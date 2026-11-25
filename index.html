@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#f4f6fb">
+    <link rel="manifest" href="manifest.json">
     <meta name="description" content="ספרייה אישית לקריאה, לימוד וארגון ספרי PDF ומסמכי Word.">
     <title>Books — הספרייה האישית שלך</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%235368d9'/%3E%3Cpath d='M18 15h20a10 10 0 0 1 10 10v25H27a9 9 0 0 0-9 9z' fill='none' stroke='white' stroke-width='4' stroke-linejoin='round'/%3E%3C/svg%3E">
@@ -30,6 +31,7 @@
                     <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
                     <span data-button-label>הוספת ספר</span>
                 </button>
+                <button class="library-control pwa-install-button" id="pwa-install-button" type="button" hidden>התקנת האפליקציה</button>
                 <div id="custom-home-buttons" class="custom-button-host" aria-label="כפתורים אישיים"></div>
             </div>
         </header>
@@ -88,7 +90,6 @@
                 <section class="settings-card">
                     <h2>תצוגת הספרייה</h2>
                     <p class="settings-help">בחרו את סידור הספרים והמרווח ביניהם.</p>
-                    <div class="settings-row"><label for="settings-appearance">מראה הממשק</label><select id="settings-appearance" class="settings-input"><option value="system">לפי המכשיר</option><option value="light">בהירה</option><option value="dark">כהה</option></select></div>
                     <div class="settings-row"><label for="settings-text-size">גודל טקסט</label><select id="settings-text-size" class="settings-input"><option value="small">קטן</option><option value="normal">רגיל</option><option value="large">גדול</option></select></div>
                     <div class="settings-row"><label for="settings-view">סגנון תצוגה</label><select id="settings-view" class="settings-input"><option value="large-icons">סמלים גדולים</option><option value="icons">סמלים</option><option value="list">רשימה</option><option value="details">פרטים</option></select></div>
                     <div class="settings-row"><label for="settings-density">מרווח</label><select id="settings-density" class="settings-input"><option value="compact">צפוף</option><option value="comfortable">נוח</option><option value="spacious">מרווח</option></select></div>
@@ -120,15 +121,23 @@
                 </section>
                 <section class="settings-card wide">
                     <h2>עורך כפתורים</h2>
-                    <p class="settings-help">בחרו מסך כדי לשנות כפתורים, כולל תפריטי הספרים. אפשר ליצור כפתורים ופעולות משלכם דרך שפת ההגדרות הבטוחה שבהמשך.</p>
+                    <p class="settings-help">שנו כל כפתור קיים, או בנו כפתור חדש לסרגלים ולתפריטי הספרים. כפתורים חדשים יכולים לפתוח אתר בחלונית הקורא או מסמך PDF מתיקיית books.</p>
                     <div class="settings-row"><label for="button-editor-area">אזור לעריכה</label><select id="button-editor-area" class="settings-input"><option value="home">עמוד הספרייה</option><option value="reader">סרגל הקורא</option></select></div>
                     <div id="button-editor-list" class="button-editor-list"></div>
-                    <div class="custom-code-editor">
-                        <label class="field-label" for="custom-button-code">כפתורים ופעולות משלכם</label>
-                        <p class="settings-help">הדביקו הגדרות כפתור בפורמט המובנה. מיקומים: <code>home_toolbar</code>, <code>reader_toolbar</code>, <code>home_page_book_cover_dropdown_menu</code>. הפעולות: <code>settings</code>, <code>add-book</code>, <code>new-shelf</code>, <code>favorites</code>, <code>all-books</code>, <code>open_book</code>, <code>toggle_favorite</code>, <code>rename_book</code>, <code>edit_tags</code>, <code>delete_book</code>, <code>formulas</code>, <code>geometry</code>, <code>tiktek</code>, <code>download-page</code>, <code>calculator</code>, <code>bookmarks</code>, <code>toc</code>, <code>thumbnails</code>, <code>bookmark-current</code>, <code>fullscreen</code>, <code>shortcuts</code>, <code>zoom-in</code>, <code>zoom-out</code>, <code>next-page</code>, <code>previous-page</code>, <code>close-reader</code>.</p>
-                        <p class="settings-help">בכל בלוק נדרשים <code>location</code>, <code>title</code> ו־<code>action</code>. אפשר להוסיף <code>color</code> ו־<code>textcolor</code>. כל כפתור יבצע פעולה מהרשימה בלבד.</p>
-                        <textarea id="custom-button-code" class="settings-input custom-button-code" spellcheck="false" dir="ltr" placeholder='new_button; location: home_page_book_cover_dropdown_menu; title: "Toggle favorite"; action: toggle_favorite; color: #43A047; textcolor: #FFFFFF;'></textarea>
-                        <button class="modal-action primary" type="button" onclick="createButtonsFromCode()">יצירת כפתורים מהקוד</button>
+                    <div class="custom-button-creator" aria-labelledby="custom-button-builder-title">
+                        <div class="custom-button-creator-heading"><div><p class="calculator-eyebrow">כפתור חדש</p><h3 id="custom-button-builder-title">בונה הכפתורים</h3></div><span class="custom-button-creator-badge">גמיש ובטוח</span></div>
+                        <p class="settings-help">לשמירה על הספרייה בטוחה, הכפתור לא מריץ JavaScript שרירותי. במקום זאת אפשר ליצור קיצורי דרך לאתרים, למסמכי PDF ולפעולות המובנות של הספרייה.</p>
+                        <div class="custom-button-creator-grid">
+                            <label>כותרת הכפתור<input id="custom-button-title" class="settings-input" type="text" maxlength="48" placeholder="למשל: שיעור וידאו"></label>
+                            <label>מיקום<select id="custom-button-location" class="settings-input"><option value="reader_toolbar">הקורא · סרגל הכלים</option><option value="reader_tools_menu">הקורא · תפריט הכלים</option><option value="home_toolbar">הספרייה · סרגל עליון</option><option value="home_page_book_cover_dropdown_menu">הספרייה · תפריט ספר</option></select></label>
+                            <label>סוג פעולה<select id="custom-button-type" class="settings-input"><option value="open-url">פתיחת אתר בחלונית הקורא</option><option value="open-pdf">פתיחת PDF מתיקיית books</option><option value="built-in">פעולה מובנית</option></select></label>
+                            <label>צבע הכפתור<input id="custom-button-color" class="settings-color" type="color" value="#5368d9"></label>
+                            <label id="custom-button-url-field" class="wide-field">כתובת אתר<input id="custom-button-url" class="settings-input" type="url" dir="ltr" placeholder="https://example.com"></label>
+                            <label id="custom-button-file-field" class="wide-field" hidden>שם קובץ PDF בתיקיית books<input id="custom-button-file" class="settings-input" type="text" dir="ltr" placeholder="worksheet.pdf"></label>
+                            <label id="custom-button-action-field" class="wide-field" hidden>פעולה מובנית<select id="custom-button-action" class="settings-input"><option value="calculator">מחשבון</option><option value="bookmarks">סימניות והערות</option><option value="toc">תוכן עניינים</option><option value="thumbnails">תמונות ממוזערות</option><option value="bookmark-current">הוספת סימניה</option><option value="fullscreen">מסך מלא</option><option value="shortcuts">קיצורי מקלדת</option><option value="zoom-in">הגדלה</option><option value="zoom-out">הקטנה</option><option value="next-page">העמוד הבא</option><option value="previous-page">העמוד הקודם</option><option value="close-reader">סגירת הקורא</option><option value="settings">פתיחת הגדרות</option><option value="add-book">הוספת ספר</option><option value="new-shelf">מדף חדש</option><option value="favorites">הצגת מועדפים</option><option value="all-books">הצגת כל הספרים</option><option value="open_book">פתיחת הספר</option><option value="toggle_favorite">שינוי מועדף</option><option value="rename_book">שינוי שם הספר</option><option value="edit_tags">עריכת תגיות</option><option value="delete_book">מחיקת הספר</option></select></label>
+                        </div>
+                        <p id="custom-button-builder-hint" class="settings-help custom-button-builder-hint" aria-live="polite"></p>
+                        <button class="modal-action primary" type="button" onclick="createCustomButton()">יצירת כפתור</button>
                     </div>
                 </section>
                 <section class="settings-card wide">
@@ -167,6 +176,7 @@
                         <button class="reader-btn-icon" type="button" data-button-id="reader-shortcuts" aria-label="קיצורי מקלדת" onclick="showReaderShortcuts()">⌨ <span class="button-visible-label">קיצורי מקלדת</span></button>
                         <button class="reader-btn-icon" type="button" data-button-id="reader-zoom-out" aria-label="הקטנת תצוגה" onclick="zoom(-1)">− <span class="button-visible-label">הקטנה</span></button>
                         <button class="reader-btn-icon" type="button" data-button-id="reader-zoom-in" aria-label="הגדלת תצוגה" onclick="zoom(1)">＋ <span class="button-visible-label">הגדלה</span></button>
+                        <div id="custom-reader-menu-buttons" class="custom-reader-menu-buttons" aria-label="כפתורים אישיים בתפריט הכלים"></div>
                     </div>
                 </details>
                 <button class="reader-btn-icon reference-toolbar-button" type="button" data-button-id="reader-formulas" title="Formulas" aria-label="Formulas" onclick="toggleReferencePdf('formulas')"><span class="button-visible-label">Formulas</span></button>
@@ -184,7 +194,7 @@
         <div id="bookmarks-panel" class="reader-popover" hidden><h3>סימניות והערות בספר הזה</h3><div id="bookmark-list"></div><div class="reader-note-row"><button class="reader-panel-btn" type="button" data-button-id="reader-bookmark-note" onclick="addCurrentNote()">הערה בעמוד הנוכחי</button></div></div>
         <button id="toc-sidebar-toggle" class="toc-sidebar-toggle" data-button-id="reader-toc" type="button" aria-expanded="false" aria-controls="toc-sidebar" aria-label="פתיחת תוכן העניינים" onclick="toggleTocSidebar()"><span data-button-label>☰</span></button>
         <aside id="toc-sidebar" class="toc-sidebar" aria-label="תוכן עניינים">
-            <div class="toc-sidebar-heading"><h2>תוכן עניינים</h2><button class="toc-manage-button" data-button-id="reader-toc-add" type="button" aria-label="הוספה וניהול של פרקים" onclick="openTocModal()">＋ פרק</button></div>
+            <div class="toc-sidebar-heading"><div class="toc-heading-row"><h2>תוכן עניינים</h2><button class="toc-manage-button" data-button-id="reader-toc-add" type="button" aria-label="הוספה וניהול של פרקים" onclick="openTocModal()">＋ פרק</button></div><input id="toc-search" class="toc-search" type="search" autocomplete="off" placeholder="חיפוש בתוכן העניינים" aria-label="חיפוש בתוכן העניינים"></div>
             <div id="toc-sidebar-list" class="toc-sidebar-list"><p class="toc-empty">בחרו ספר כדי לראות פרקים.</p></div>
         </aside>
         <aside id="calculator-panel" class="reader-popover calculator-drawer" hidden role="complementary" aria-label="מחשבון מדעי">

@@ -1,1 +1,15 @@
-[]
+{
+  "id": "./",
+  "name": "Books — Your personal library",
+  "short_name": "Books",
+  "description": "A personal library for reading and organizing books.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f4f6fb",
+  "theme_color": "#5368d9",
+  "icons": [
+    { "src": "icons/app-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

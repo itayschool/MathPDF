@@ -1,4 +1,4 @@
-# MathPDF
+# Books
 
 Static Hebrew-first reading library for GitHub Pages. Upload the contents of this folder to the publishing root of the repository; no build step is required.
 

@@ -487,6 +487,7 @@
         let currentScale = 1;
         let readerEpoch = 0;
         let scrollFrame = 0;
+        let zoomSequence = 0;
         let navigationTargetPage = null;
         let navigationTargetTimer = 0;
         let toastTimer = 0;
@@ -956,7 +957,11 @@
                     viewport.replaceChildren(article); viewport.scrollTop = 0;
                     return;
                 }
-                const pdf = await pdfjsLib.getDocument({ data: book.data.slice(0) }).promise;
+                // `slice()` made a second full in-memory copy of every PDF.  The book
+                // object is a short-lived IndexedDB result, so hand its bytes directly
+                // to PDF.js and let the worker take ownership of them instead.
+                const pdfBytes = book.data instanceof Uint8Array ? book.data : new Uint8Array(book.data);
+                const pdf = await pdfjsLib.getDocument({ data: pdfBytes }).promise;
                 currentPdf = pdf;
                 currentActiveBookId = book.id;
                 currentScale = 1;
@@ -972,6 +977,7 @@
                 const firstSize = firstPage.getViewport({ scale: 1 });
                 const availableWidth = Math.max(270, viewport.clientWidth - 40);
                 const baseScale = Math.min(1, availableWidth / firstSize.width);
+                const estimatedWidth = Math.min(firstSize.width * baseScale, availableWidth);
                 const estimatedHeight = Math.max(360, firstSize.height * baseScale);
                 const fragment = document.createDocumentFragment();
                 for (let i = 1; i <= pdf.numPages; i++) {
@@ -979,8 +985,12 @@
                     row.className = 'document-scroller__row';
                     const pageContainer = document.createElement('div');
                     pageContainer.className = 'document-scroller__page is-loading';
-                    pageContainer.style.width = `${Math.min(firstSize.width * baseScale, availableWidth)}px`;
+                    pageContainer.style.width = `${estimatedWidth}px`;
                     pageContainer.style.height = `${estimatedHeight}px`;
+                    // Keep an unscaled layout size so repeated zooming never compounds
+                    // rounded CSS pixel values.
+                    pageContainer.dataset.baseWidth = String(estimatedWidth);
+                    pageContainer.dataset.baseHeight = String(estimatedHeight);
                     pageContainer.dataset.page = String(i);
                     pageContainer.id = `page-row-${i}`;
                     row.appendChild(pageContainer);
@@ -1007,22 +1017,41 @@
                 const button = document.createElement('button'); button.type = 'button'; button.className = 'toc-entry';
                 const title = document.createElement('span'); title.textContent = item.title;
                 const page = document.createElement('small'); page.textContent = `עמ׳ ${item.page}`;
+                button.dataset.tocSearch = String(item.title || '').toLocaleLowerCase('he');
                 button.append(title, page); button.addEventListener('click', () => jumpToPage(item.page)); list.appendChild(button);
             });
+            filterTocEntries(document.getElementById('toc-search')?.value || '');
+        }
+        function filterTocEntries(value) {
+            const list = document.getElementById('toc-sidebar-list');
+            const query = String(value || '').trim().toLocaleLowerCase('he');
+            const entries = [...list.querySelectorAll('.toc-entry')];
+            let visible = 0;
+            entries.forEach(entry => {
+                const match = !query || entry.dataset.tocSearch.includes(query);
+                entry.hidden = !match;
+                if (match) visible++;
+            });
+            list.querySelector('.toc-search-empty')?.remove();
+            if (query && entries.length && !visible) {
+                const empty = document.createElement('p'); empty.className = 'toc-empty toc-search-empty'; empty.textContent = 'לא נמצאו פרקים מתאימים.'; list.appendChild(empty);
+            }
+        }
+
+        function pageFitScale(page) {
+            const viewport = document.getElementById('document-viewport');
+            const availableWidth = Math.max(250, viewport.clientWidth - 40);
+            return Math.min(1, availableWidth / page.getViewport({ scale: 1 }).width);
         }
 
         function pageScale(page) {
-            const viewport = document.getElementById('document-viewport');
-            const availableWidth = Math.max(250, viewport.clientWidth - 40);
-            const fitScale = Math.min(1, availableWidth / page.getViewport({ scale: 1 }).width);
-            return Math.min(fitScale * currentScale, 3.5);
+            // The canvas resolution is intentionally capped to protect memory. The
+            // displayed page itself has a much wider zoom range in pageDisplayScale.
+            return Math.min(pageFitScale(page) * currentScale, 3.5);
         }
 
         function pageDisplayScale(page) {
-            const viewport = document.getElementById('document-viewport');
-            const availableWidth = Math.max(250, viewport.clientWidth - 40);
-            const fitScale = Math.min(1, availableWidth / page.getViewport({ scale: 1 }).width);
-            return fitScale * currentScale;
+            return pageFitScale(page) * currentScale;
         }
 
         function releasePageCanvas(container) {
@@ -1056,6 +1085,11 @@
                 canvas.height = Math.ceil(vp.height);
                 container.style.width = `${Math.max(1, Math.ceil(displayViewport.width))}px`;
                 container.style.height = `${Math.max(1, Math.ceil(displayViewport.height))}px`;
+                // Store the page's fit-to-width dimensions, rather than deriving
+                // later values from its current CSS dimensions. That makes zooming
+                // stable even after many in/out cycles.
+                container.dataset.baseWidth = String(Math.max(1, displayViewport.width / currentScale));
+                container.dataset.baseHeight = String(Math.max(1, displayViewport.height / currentScale));
                 canvas.style.width = `${Math.max(1, Math.ceil(displayViewport.width))}px`;
                 canvas.style.height = `${Math.max(1, Math.ceil(displayViewport.height))}px`;
                 const context = canvas.getContext('2d', { alpha: false });
@@ -1144,29 +1178,95 @@
             }
         }
 
+        function clampZoomScale(scale) {
+            // 1%–25,600% keeps the reader effectively unbounded for normal use,
+            // while still avoiding browser layout sizes that become unreliable.
+            return Math.max(.01, Math.min(256, scale));
+        }
+
+        function captureZoomAnchor(viewport) {
+            const viewportRect = viewport.getBoundingClientRect();
+            const screenX = viewportRect.left + viewport.clientWidth / 2;
+            const screenY = viewportRect.top + viewport.clientHeight / 2;
+            let closest = null;
+            let closestDistance = Infinity;
+            viewport.querySelectorAll('.document-scroller__page').forEach(page => {
+                const rect = page.getBoundingClientRect();
+                if (!rect.width || !rect.height) return;
+                const distance = Math.abs((rect.top + rect.bottom) / 2 - screenY);
+                if (distance < closestDistance) {
+                    closestDistance = distance;
+                    closest = { page, rect };
+                }
+            });
+            if (!closest) return null;
+            return {
+                page: closest.page,
+                pageNumber: Number(closest.page.dataset.page) || 1,
+                screenX,
+                screenY,
+                xRatio: Math.max(0, Math.min(1, (screenX - closest.rect.left) / closest.rect.width)),
+                yRatio: Math.max(0, Math.min(1, (screenY - closest.rect.top) / closest.rect.height))
+            };
+        }
+
+        function restoreZoomAnchor(viewport, anchor) {
+            if (!anchor?.page?.isConnected) return;
+            const rect = anchor.page.getBoundingClientRect();
+            if (!rect.width || !rect.height) return;
+            const maxTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+            const maxLeft = Math.max(0, viewport.scrollWidth - viewport.clientWidth);
+            const nextTop = viewport.scrollTop + (rect.top + rect.height * anchor.yRatio - anchor.screenY);
+            const nextLeft = viewport.scrollLeft + (rect.left + rect.width * anchor.xRatio - anchor.screenX);
+            viewport.scrollTop = Math.max(0, Math.min(maxTop, nextTop));
+            viewport.scrollLeft = Math.max(0, Math.min(maxLeft, nextLeft));
+        }
+
         function zoom(delta) {
-            if (!currentPdf) return;
+            if (!currentPdf || !Number.isFinite(Number(delta))) return;
             const direction = Number(delta) >= 0 ? 1 : -1;
+            const nextScale = clampZoomScale(currentScale * (direction > 0 ? 1.16 : 1 / 1.16));
+            if (nextScale === currentScale) return;
+
             const viewport = document.getElementById('document-viewport');
-            const beforeScrollTop = viewport.scrollTop;
-            const beforeScale = currentScale;
-            currentScale = Math.max(.001, Math.min(1000000, currentScale * (direction > 0 ? 1.16 : 1 / 1.16)));
+            const anchor = captureZoomAnchor(viewport);
+            const transaction = ++zoomSequence;
+            const previousScale = currentScale;
+            viewport.classList.add('is-zooming');
+            currentScale = nextScale;
             readerEpoch++;
             desiredPageNumbers.clear();
-            const ratio = currentScale / beforeScale;
-            document.querySelectorAll('.document-scroller__page').forEach(page => {
-                const width = Number.parseFloat(page.style.width) || page.getBoundingClientRect().width;
-                const height = Number.parseFloat(page.style.height) || page.getBoundingClientRect().height;
+
+            viewport.querySelectorAll('.document-scroller__page').forEach(page => {
+                const baseWidth = Number.parseFloat(page.dataset.baseWidth) || page.getBoundingClientRect().width / Math.max(.0001, previousScale);
+                const baseHeight = Number.parseFloat(page.dataset.baseHeight) || page.getBoundingClientRect().height / Math.max(.0001, previousScale);
                 releasePageCanvas(page);
-                page.style.width = `${Math.max(1, width * ratio)}px`;
-                page.style.height = `${Math.max(1, height * ratio)}px`;
+                page.style.width = `${Math.max(1, baseWidth * currentScale)}px`;
+                page.style.height = `${Math.max(1, baseHeight * currentScale)}px`;
             });
-            viewport.scrollTop = beforeScrollTop * ratio;
-            handleScroll();
+
+            // Anchor to the exact point under the viewport centre, instead of
+            // multiplying scrollTop. Page gaps and differently sized pages then
+            // cannot cause a jump to another page.
+            restoreZoomAnchor(viewport, anchor);
+            if (anchor) {
+                if (typeof window.setReaderPageDisplay === 'function') window.setReaderPageDisplay(anchor.pageNumber);
+                else document.getElementById('page-num-input').value = String(anchor.pageNumber);
+            }
+
+            requestAnimationFrame(() => {
+                if (transaction !== zoomSequence) return;
+                // A second correction accounts for the forced layout after all page
+                // dimensions have changed, while keeping the adjustment immediate.
+                restoreZoomAnchor(viewport, anchor);
+                viewport.classList.remove('is-zooming');
+                handleScroll();
+            });
         }
 
         function closeReader() {
             const modal = document.getElementById('reader-modal');
+            const viewport = document.getElementById('document-viewport');
             const returnFocus = modal.dataset.returnFocus;
             modal.classList.remove('active');
             modal.setAttribute('aria-hidden', 'true');
@@ -1176,7 +1276,15 @@
             renderingPages.forEach(state => state.task?.cancel());
             document.querySelectorAll('.document-scroller__page').forEach(releasePageCanvas);
             renderedPages.clear();
-            if (currentPdf && currentPdf.destroy) currentPdf.destroy();
+            renderingPages.clear();
+            // Remove the page placeholders as well as their canvases.  Leaving a long
+            // document's DOM tree attached after closing kept a surprising amount of
+            // layout and PDF worker memory alive between books.
+            viewport.replaceChildren();
+            if (currentPdf) {
+                try { currentPdf.cleanup?.(); } catch {}
+                try { currentPdf.destroy?.(); } catch {}
+            }
             currentPdf = null;
             currentDocxHtml = '';
             document.querySelector('.page-navigator').hidden = false;
@@ -1229,6 +1337,7 @@
         }
 
         document.getElementById('book-search').addEventListener('input', renderLibrary);
+        document.getElementById('toc-search').addEventListener('input', event => filterTocEntries(event.target.value));
         document.getElementById('toc-form').addEventListener('submit', saveCustomChapter);
         document.getElementById('toc-modal').addEventListener('click', event => {
             if (event.target.id === 'toc-modal') closeTocModal();
@@ -1289,6 +1398,8 @@
     let calculatorHistory = [];
     let renameBookId = null;
     let currentReferenceKind = null;
+    let currentReferenceEntry = null;
+    let currentReferenceBookId = null;
     let referenceLoadToken = 0;
     let referenceObserver = null;
     const referenceRenderTasks = new Map();
@@ -1296,16 +1407,23 @@
     let pendingWallpaperAssetId = '';
     let wallpaperManifest = [];
     let iconManifest = [];
+    // A reference PDF is cached only while its pane is visible.  Keeping every
+    // opened reference document here made the reader retain large PDF workers.
     const referencePdfCache = new Map();
     const referenceZoomLevels = new Map();
-    const referenceStateKey = kind => `books-reference-state-v1:${kind}`;
+    const referenceStateKey = (kind, bookId = currentActiveBookId) => `books-reference-state-v2:${bookId ?? 'library'}:${kind}`;
+    const legacyReferenceStateKey = kind => `books-reference-state-v1:${kind}`;
+    const tiktekUrlsByBook = new Map();
+    const tiktekFramesByBook = new Map();
     const localAssetUrls = new Map();
     const readerThemes = ['dark', 'midnight', 'light', 'sepia', 'paper', 'forest', 'ocean', 'rose', 'lavender', 'mint', 'amber', 'slate', 'plum', 'crimson', 'solarized', 'contrast'];
 
     function readPreferences() {
-        const defaults = { folders: [], compact: false, readerTheme: 'dark', sort: 'added', username: 'your-username', avatar: '📚', accent: '#5368d9', appearance: 'system', language: 'he', uiScale: 'normal', view: 'large-icons', cardDensity: 'comfortable', showProgress: true, showContinue: true, reduceMotion: false, customThemes: [], customWallpapers: [], customIcons: [], buttonSettings: { home: {}, reader: {} } };
+        const defaults = { folders: [], compact: false, readerTheme: 'dark', sort: 'added', username: 'your-username', avatar: '📚', accent: '#5368d9', language: 'he', uiScale: 'normal', view: 'large-icons', cardDensity: 'comfortable', showProgress: true, showContinue: true, reduceMotion: false, customThemes: [], customWallpapers: [], customIcons: [], buttonSettings: { home: {}, reader: {} } };
         try {
             const stored = JSON.parse(localStorage.getItem(prefsKey) || '{}');
+            // The former device light/dark override is retired. Themes now own every color decision.
+            delete stored.appearance;
             return { ...defaults, ...stored,
                 customThemes: Array.isArray(stored.customThemes) ? stored.customThemes : [],
                 customWallpapers: Array.isArray(stored.customWallpapers) ? stored.customWallpapers : [],
@@ -1442,7 +1560,12 @@
             const customLabel = document.createElement('span'); customLabel.dataset.buttonLabel = ''; customLabel.textContent = config.title || item.title; customButton.appendChild(customLabel);
             if (config.color || item.color) customButton.style.setProperty('--button-accent', config.color || item.color);
             if (config.textColor || item.textColor) customButton.style.color = config.textColor || item.textColor;
-            customButton.addEventListener('click', event => { event.stopPropagation(); menu.open = false; runBookCustomAction(item.action, book); });
+            if (config.icon) resolveButtonIcon(config.icon).then(url => {
+                if (!url || !customButton.isConnected) return;
+                const image = document.createElement('img'); image.className = 'custom-button-icon'; image.alt = ''; image.src = url;
+                customButton.prepend(image);
+            });
+            customButton.addEventListener('click', event => { event.stopPropagation(); menu.open = false; runBookCustomAction(item, book); });
             panel.appendChild(customButton);
         });
         menu.append(trigger, panel);
@@ -1499,7 +1622,6 @@
         document.getElementById('username-setting').value = preferences.username || 'your-username';
         document.getElementById('avatar-setting').value = preferences.avatar || '📚';
         document.getElementById('accent-setting').value = preferences.accent || '#5368d9';
-        document.getElementById('settings-appearance').value = preferences.appearance || 'system';
         document.getElementById('settings-text-size').value = preferences.uiScale || 'normal';
         document.getElementById('settings-view').value = preferences.view || 'large-icons';
         document.getElementById('settings-density').value = preferences.cardDensity || 'comfortable';
@@ -1539,13 +1661,6 @@
         const book = await getBookById(id); if (!book) return;
         if (!confirm(`למחוק לצמיתות את ״${getBookDisplayTitle(book)}״? אי אפשר יהיה לשחזר אותו.`)) return;
         await permanentlyDeleteBookFromDB(id); await renderDeletedBooks(); renderLibrary(); showToast('הספר נמחק לצמיתות.');
-    }
-    function applyAppearance(mode) {
-        const preference = ['system', 'light', 'dark'].includes(mode) ? mode : 'system';
-        const resolved = preference === 'system'
-            ? (window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
-            : preference;
-        document.body.dataset.uiMode = resolved;
     }
     function applyUiScale(size) {
         const scale = { small: '0.94', normal: '1', large: '1.06' }[size] || '1';
@@ -1755,6 +1870,7 @@
         const accent = validThemeColor(theme.accent, '#7b8cf2');
         const text = validThemeColor(theme.text, colorLuminance(background) < .43 ? '#f4f6fb' : '#20283a');
         const body = document.body;
+        delete body.dataset.uiMode;
         body.dataset.libraryTheme = theme.id || 'custom';
         body.style.setProperty('--surface', background);
         body.style.setProperty('--surface-container', toolbar);
@@ -1765,12 +1881,14 @@
         body.style.setProperty('--primary', accent);
         body.style.setProperty('--primary-hover', `color-mix(in srgb, ${accent} 78%, ${text})`);
         body.style.setProperty('--primary-soft', `color-mix(in srgb, ${accent} 16%, ${background})`);
+        body.style.setProperty('--shadow', colorLuminance(background) < .43 ? '0 18px 48px rgba(0,0,0,.28)' : '0 16px 44px rgba(30,42,73,.09)');
         body.style.colorScheme = colorLuminance(background) < .43 ? 'dark' : 'light';
         document.documentElement.style.colorScheme = body.style.colorScheme;
+        document.querySelector('meta[name="theme-color"]')?.setAttribute('content', background);
         let wallpaper = theme.wallpaperUrl || '';
         if (!wallpaper && theme.wallpaperAssetId) wallpaper = await getLocalAssetUrl(theme.wallpaperAssetId);
         const safeUrl = safeWallpaperUrl(wallpaper);
-        if (safeUrl) body.style.backgroundImage = `linear-gradient(${background}88, ${background}88), url(${JSON.stringify(safeUrl)})`;
+        if (safeUrl) body.style.backgroundImage = `url(${JSON.stringify(safeUrl)})`;
         else body.style.removeProperty('background-image');
     }
     async function applyCustomReaderTheme(theme) {
@@ -1930,30 +2048,52 @@
         }
         renderCustomButtonHosts();
     }
-    function renderCustomButtonHosts() {
-        for (const area of ['home', 'reader']) {
-            const host = document.getElementById(area === 'home' ? 'custom-home-buttons' : 'custom-reader-buttons');
-            if (!host) continue;
-            host.replaceChildren();
-            const custom = (preferences.buttonSettings?.[area]?.customButtons || []).filter(item =>
-                !item.location || item.location === `${area}_toolbar`
-            );
-            custom.forEach(item => {
-                const config = buttonConfig(area, item.id);
-                if (config.visible === false) return;
-                const button = document.createElement('button'); button.type = 'button'; button.className = 'custom-added-button'; button.dataset.customAction = item.action; button.dataset.buttonId = item.id;
-                const label = config.title || item.title;
-                button.title = label; button.setAttribute('aria-label', label);
-                if (config.color) button.style.setProperty('--button-accent', config.color);
-                if (config.textColor) button.style.color = config.textColor;
-                if (config.icon?.type === 'asset') getLocalAssetUrl(config.icon.value).then(url => { if (url && button.isConnected) { const image = document.createElement('img'); image.className = 'custom-button-icon'; image.alt = ''; image.src = url; button.prepend(image); } });
-                else if (config.icon?.type === 'preset') { const image = document.createElement('img'); image.className = 'custom-button-icon'; image.alt = ''; image.src = new URL(`icons/${encodeURIComponent(config.icon.value)}`, document.baseURI).href; button.appendChild(image); }
-                const text = document.createElement('span'); text.textContent = label; button.appendChild(text);
-                button.addEventListener('click', () => runCustomAction(item.action, area)); host.appendChild(button);
-            });
-        }
+    function appendCustomButton(host, item, area) {
+        const config = buttonConfig(area, item.id);
+        if (!host || config.visible === false) return;
+        const button = document.createElement('button'); button.type = 'button'; button.className = 'custom-added-button'; button.dataset.buttonId = item.id;
+        const label = config.title || item.title;
+        button.title = label; button.setAttribute('aria-label', label);
+        if (config.color || item.color) button.style.setProperty('--button-accent', config.color || item.color);
+        if (config.textColor || item.textColor) button.style.color = config.textColor || item.textColor;
+        if (config.icon?.type === 'asset') getLocalAssetUrl(config.icon.value).then(url => { if (url && button.isConnected) { const image = document.createElement('img'); image.className = 'custom-button-icon'; image.alt = ''; image.src = url; button.prepend(image); } });
+        else if (config.icon?.type === 'preset') { const image = document.createElement('img'); image.className = 'custom-button-icon'; image.alt = ''; image.src = new URL(`icons/${encodeURIComponent(config.icon.value)}`, document.baseURI).href; button.appendChild(image); }
+        const text = document.createElement('span'); text.textContent = label; button.appendChild(text);
+        button.addEventListener('click', () => runCustomAction(item.action, area, item)); host.appendChild(button);
     }
-    function runCustomAction(action, area) {
+    function renderCustomButtonHosts() {
+        const homeHost = document.getElementById('custom-home-buttons');
+        const readerHost = document.getElementById('custom-reader-buttons');
+        const readerMenuHost = document.getElementById('custom-reader-menu-buttons');
+        homeHost?.replaceChildren(); readerHost?.replaceChildren(); readerMenuHost?.replaceChildren();
+        (preferences.buttonSettings?.home?.customButtons || []).forEach(item => {
+            if (!item.location || item.location === 'home_toolbar') appendCustomButton(homeHost, item, 'home');
+        });
+        (preferences.buttonSettings?.reader?.customButtons || []).forEach(item => {
+            if (!item.location || item.location === 'reader_toolbar') appendCustomButton(readerHost, item, 'reader');
+            else if (item.location === 'reader_tools_menu') appendCustomButton(readerMenuHost, item, 'reader');
+        });
+    }
+    function customReferenceFromAction(action, item) {
+        if (!action || typeof action !== 'object') return null;
+        const title = String(item?.title || action.title || 'Reference').trim().slice(0, 80) || 'Reference';
+        const id = String(action.referenceId || `custom-reference-${item?.id || referenceHash(title)}`);
+        if (action.type === 'reference-url') {
+            const url = validExternalUrl(action.url);
+            return url ? { id, title, url, type: 'iframe' } : null;
+        }
+        if (action.type === 'reference-pdf') {
+            const file = String(action.file || '').trim();
+            return /^[^\\/:*?"<>|]+\.pdf$/i.test(file) ? { id, title, file, type: 'pdf' } : null;
+        }
+        return null;
+    }
+    function runCustomAction(action, area, item) {
+        const reference = customReferenceFromAction(action, item);
+        if (reference) {
+            if (!currentActiveBookId) { showToast('פתחו ספר לפני פתיחת מסמך עזר.'); return; }
+            toggleReferencePdf(reference); return;
+        }
         if (area === 'home') {
             if (action === 'settings') showSettingsPage(true);
             else if (action === 'add-book') document.getElementById('file-input').click();
@@ -2030,8 +2170,9 @@
             return { location, title: title.slice(0, 48), action, color: color || '', textColor: textColor || '' };
         });
     }
-    function createButtonsFromCode() {
-        const source = document.getElementById('custom-button-code').value;
+    function createButtonsFromCode(source = '') {
+        const codeField = document.getElementById('custom-button-code');
+        source ||= codeField?.value || '';
         try {
             const definitions = parseCustomButtonBlocks(source);
             if (!definitions.length) throw new Error('הוסיפו לפחות בלוק אחד שמתחיל ב-new_button;.');
@@ -2043,12 +2184,83 @@
                 preferences.buttonSettings[area].customButtons.push(item);
                 preferences.buttonSettings[area][id] = { title: item.title, visible: true, color: item.color || '', textColor: item.textColor || '' };
             });
-            savePreferences(); document.getElementById('custom-button-code').value = '';
+            savePreferences(); if (codeField) codeField.value = '';
             renderButtonEditor(); renderLibrary(); applyButtonSettings();
             showToast(`${definitions.length} כפתור${definitions.length === 1 ? '' : 'ים'} נוצר${definitions.length === 1 ? '' : 'ו'}.`);
         } catch (error) { showToast(error.message || 'לא ניתן ליצור כפתורים מההגדרות.'); }
     }
-    async function runBookCustomAction(action, book) {
+    const homeButtonActions = new Set(['settings', 'add-book', 'new-shelf', 'favorites', 'all-books']);
+    const bookMenuButtonActions = new Set(['open_book', 'toggle_favorite', 'rename_book', 'edit_tags', 'delete_book']);
+    function isBuiltInActionAllowed(location, action) {
+        if (location === 'home_toolbar') return homeButtonActions.has(action);
+        if (location === 'home_page_book_cover_dropdown_menu') return bookMenuButtonActions.has(action);
+        return customButtonActions.has(action) && !homeButtonActions.has(action) && !bookMenuButtonActions.has(action);
+    }
+    function syncCustomButtonCreator() {
+        const type = document.getElementById('custom-button-type')?.value || 'open-url';
+        const location = document.getElementById('custom-button-location')?.value || 'reader_toolbar';
+        const urlField = document.getElementById('custom-button-url-field');
+        const fileField = document.getElementById('custom-button-file-field');
+        const actionField = document.getElementById('custom-button-action-field');
+        const actionSelect = document.getElementById('custom-button-action');
+        const hint = document.getElementById('custom-button-builder-hint');
+        if (urlField) urlField.hidden = type !== 'open-url';
+        if (fileField) fileField.hidden = type !== 'open-pdf';
+        if (actionField) actionField.hidden = type !== 'built-in';
+        if (actionSelect) {
+            [...actionSelect.options].forEach(option => { option.disabled = !isBuiltInActionAllowed(location, option.value); });
+            if (actionSelect.selectedOptions[0]?.disabled) actionSelect.value = [...actionSelect.options].find(option => !option.disabled)?.value || '';
+        }
+        if (!hint) return;
+        if ((type === 'open-url' || type === 'open-pdf') && location === 'home_toolbar') {
+            hint.textContent = 'מסמך עזר צריך ספר פתוח, לכן יש להציב כפתור כזה בקורא או בתפריט של ספר.';
+        } else if (type === 'open-url') hint.textContent = 'פותח את האתר בחלונית הימנית בתוך הקורא. אתרים שחוסמים הטמעה עשויים להציג מסך חסימה.';
+        else if (type === 'open-pdf') hint.textContent = 'הקלידו שם מדויק של קובץ PDF שנמצא בתיקיית books, למשל worksheet.pdf.';
+        else if (location === 'home_toolbar') hint.textContent = 'כאן זמינות פעולות של הספרייה, כגון הגדרות, הוספת ספר או מועדפים.';
+        else if (location === 'home_page_book_cover_dropdown_menu') hint.textContent = 'כאן זמינות פעולות על הספר הנבחר, כגון פתיחה, שינוי מועדף, תגיות או מחיקה.';
+        else hint.textContent = 'כאן זמינות פעולות של הקורא, כגון מחשבון, סימניות, ניווט וזום.';
+    }
+    function createCustomButton() {
+        const title = document.getElementById('custom-button-title').value.trim();
+        const location = document.getElementById('custom-button-location').value;
+        const type = document.getElementById('custom-button-type').value;
+        const color = document.getElementById('custom-button-color').value;
+        if (!title) { showToast('יש להזין כותרת לכפתור.'); return; }
+        if (!['home_toolbar', 'reader_toolbar', 'reader_tools_menu', 'home_page_book_cover_dropdown_menu'].includes(location)) { showToast('מיקום הכפתור אינו תקין.'); return; }
+        let action;
+        if (type === 'open-url') {
+            const url = validExternalUrl(document.getElementById('custom-button-url').value.trim());
+            if (!url) { showToast('יש להזין כתובת אתר תקינה שמתחילה ב־http:// או https://.'); return; }
+            if (location === 'home_toolbar') { showToast('פתיחת אתר בחלונית זמינה רק בקורא או בתפריט ספר.'); return; }
+            action = { type: 'reference-url', url };
+        } else if (type === 'open-pdf') {
+            const file = document.getElementById('custom-button-file').value.trim();
+            if (!/^[^\\/:*?"<>|]+\.pdf$/i.test(file)) { showToast('יש להזין שם קובץ PDF תקין מתיקיית books.'); return; }
+            if (location === 'home_toolbar') { showToast('פתיחת PDF בחלונית זמינה רק בקורא או בתפריט ספר.'); return; }
+            action = { type: 'reference-pdf', file };
+        } else {
+            const name = document.getElementById('custom-button-action').value;
+            if (!isBuiltInActionAllowed(location, name)) { showToast('הפעולה שנבחרה אינה מתאימה למיקום הכפתור.'); return; }
+            action = name;
+        }
+        const area = location === 'home_toolbar' || location === 'home_page_book_cover_dropdown_menu' ? 'home' : 'reader';
+        const id = `custom-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+        const item = { id, title: title.slice(0, 48), location, action, color };
+        preferences.buttonSettings[area].customButtons ||= [];
+        preferences.buttonSettings[area].customButtons.push(item);
+        preferences.buttonSettings[area][id] = { title: item.title, visible: true, color: item.color };
+        savePreferences();
+        document.getElementById('custom-button-title').value = '';
+        document.getElementById('custom-button-url').value = '';
+        document.getElementById('custom-button-file').value = '';
+        renderButtonEditor(); renderLibrary(); applyButtonSettings(); syncCustomButtonCreator();
+        showToast('הכפתור החדש נוצר.');
+    }
+    async function runBookCustomAction(itemOrAction, book) {
+        const item = itemOrAction && typeof itemOrAction === 'object' && 'action' in itemOrAction ? itemOrAction : null;
+        const action = item ? item.action : itemOrAction;
+        const reference = customReferenceFromAction(action, item);
+        if (reference) { await openReader(book); if (currentActiveBookId) toggleReferencePdf(reference); return; }
         if (action === 'open_book') await openReader(book);
         else if (action === 'toggle_favorite') await persistBookPatch(book.id, { favorite: !book.favorite });
         else if (action === 'rename_book') openRenameModal(book.id);
@@ -2233,49 +2445,168 @@
         preferences.tocOpen = isOpen; savePreferences(); applyTocSidebar(isOpen);
     }
     const referenceDocuments = {
-        formulas: { title: 'Formulas', file: 'formulas.pdf' },
-        geometry: { title: 'Geometry', file: 'geometry.pdf' },
-        tiktek: { title: 'Tiktek', url: 'https://tiktek.com/il/heb-index.htm' }
+        formulas: { id: 'formulas', title: 'Formulas', file: 'formulas.pdf', type: 'pdf' },
+        geometry: { id: 'geometry', title: 'Geometry', file: 'geometry.pdf', type: 'pdf' },
+        tiktek: { id: 'tiktek', title: 'Tiktek', url: 'https://tiktek.com/il/heb-index.htm', type: 'iframe' }
     };
-    function getReferenceState(kind) {
-        try {
-            const saved = JSON.parse(localStorage.getItem(referenceStateKey(kind)) || 'null');
-            if (saved && typeof saved === 'object') return saved;
-        } catch {}
-        return { zoom: kind === 'tiktek' ? .8 : 1, scrollTop: 0 };
+    const tiktekDefaultsByCatalog = {
+        MATH1: 'https://tiktek.com/il/heb-index.htm#/TKTKJgJzBmJyCFNmR8zhGG44Iq7Wy/jstb1+9Ekmv379T6Apv6OzESuR9uxY4GSt9A==',
+        MATH2A: 'https://tiktek.com/il/heb-index.htm#/TKTKJgJzBmJyCFNmR8zhGG44Iq7Wy/jstb1+9Ekmv379T6Apv6OzESuR9uxY4GSs/Q==',
+        MATH2B: 'https://tiktek.com/il/heb-index.htm#/TKTKJgJzBmJyCFNmR8zhGG44Iq7Wy/jstb1+9Ekmv379T6Apv6OzESuR9uxY4GSs8g=='
+    };
+    function currentReferenceBook() {
+        const id = currentReferenceBookId ?? currentActiveBookId;
+        return libraryBooks.find(book => Number(book.id) === Number(id)) || null;
     }
-    function getReferenceZoom(kind) {
-        if (!referenceZoomLevels.has(kind)) {
-            const savedZoom = Number(getReferenceState(kind).zoom);
-            referenceZoomLevels.set(kind, Number.isFinite(savedZoom) && savedZoom > 0 ? savedZoom : (kind === 'tiktek' ? .8 : 1));
+    function getBookCatalogId(book = currentReferenceBook()) {
+        if (!book) return '';
+        let id = String(book.catalogId || '').toUpperCase();
+        if (!id && book.sourceName) {
+            const sourceName = String(book.sourceName).toLowerCase();
+            id = String(PUBLIC_BOOKS.find(entry => entry.file.toLowerCase() === sourceName)?.catalogId || '').toUpperCase();
         }
-        return referenceZoomLevels.get(kind);
+        if (!id) {
+            const title = `${book.title || ''} ${book.displayName || ''}`.toUpperCase();
+            id = String(PUBLIC_BOOKS.find(entry => title.includes(entry.catalogId))?.catalogId || '').toUpperCase();
+        }
+        return id;
     }
-    function saveReferenceState(kind = currentReferenceKind) {
+    function validExternalUrl(value) {
+        try {
+            const url = new URL(String(value || ''), document.baseURI);
+            return /^https?:$/.test(url.protocol) ? url.href : '';
+        } catch { return ''; }
+    }
+    function referenceHash(value) {
+        let hash = 2166136261;
+        for (const char of String(value)) { hash ^= char.charCodeAt(0); hash = Math.imul(hash, 16777619); }
+        return (hash >>> 0).toString(36);
+    }
+    function normalizeReferenceEntry(reference) {
+        if (typeof reference === 'string') return referenceDocuments[reference] ? { ...referenceDocuments[reference] } : null;
+        if (!reference || typeof reference !== 'object') return null;
+        const title = String(reference.title || reference.name || 'Reference').trim().slice(0, 80) || 'Reference';
+        if (reference.url) {
+            const url = validExternalUrl(reference.url);
+            if (!url) return null;
+            return { id: String(reference.id || `url-${referenceHash(url)}`), title, url, type: 'iframe', isTiktek: Boolean(reference.isTiktek) };
+        }
+        const file = String(reference.file || '').trim();
+        if (!file || !/^[^\\/:*?"<>|]+\.pdf$/i.test(file)) return null;
+        return { id: String(reference.id || `pdf-${referenceHash(file)}`), title, file, type: 'pdf' };
+    }
+    function referenceZoomKey(kind, bookId = currentReferenceBookId ?? currentActiveBookId) {
+        return `${bookId ?? 'library'}:${kind}`;
+    }
+    function getReferenceState(kind, bookId = currentReferenceBookId ?? currentActiveBookId) {
+        const fallback = { zoom: kind === 'tiktek' ? .8 : 1, page: 1, scrollTop: 0, scrollRatio: 0 };
+        try {
+            const saved = JSON.parse(localStorage.getItem(referenceStateKey(kind, bookId)) || 'null');
+            if (saved && typeof saved === 'object') return { ...fallback, ...saved };
+            // One-time compatibility read for reference positions saved by earlier versions.
+            const legacy = JSON.parse(localStorage.getItem(legacyReferenceStateKey(kind)) || 'null');
+            if (legacy && typeof legacy === 'object') return { ...fallback, ...legacy };
+        } catch {}
+        return fallback;
+    }
+    function getReferenceZoom(kind, bookId = currentReferenceBookId ?? currentActiveBookId) {
+        const key = referenceZoomKey(kind, bookId);
+        if (!referenceZoomLevels.has(key)) {
+            const savedZoom = Number(getReferenceState(kind, bookId).zoom);
+            referenceZoomLevels.set(key, Number.isFinite(savedZoom) && savedZoom > 0 ? savedZoom : (kind === 'tiktek' ? .8 : 1));
+        }
+        return referenceZoomLevels.get(key);
+    }
+    function setReferenceZoom(kind, value, bookId = currentReferenceBookId ?? currentActiveBookId) {
+        referenceZoomLevels.set(referenceZoomKey(kind, bookId), value);
+    }
+    function nearestReferencePage(host) {
+        const hostBounds = host.getBoundingClientRect();
+        const center = hostBounds.top + hostBounds.height / 2;
+        let page = 1;
+        let distance = Infinity;
+        host.querySelectorAll('.reference-page-wrap').forEach(wrap => {
+            const bounds = wrap.getBoundingClientRect();
+            const nextDistance = Math.abs((bounds.top + bounds.bottom) / 2 - center);
+            if (nextDistance < distance) { distance = nextDistance; page = Number(wrap.dataset.page) || 1; }
+        });
+        return page;
+    }
+    function saveTiktekUrlForBook(bookId, url) {
+        const valid = validExternalUrl(url);
+        if (!valid || bookId === null || bookId === undefined) return;
+        const key = String(bookId);
+        tiktekUrlsByBook.set(key, valid);
+        try { localStorage.setItem(`books-tiktek-url-v1:${key}`, valid); } catch {}
+    }
+    function tiktekUrlForBook(bookId = currentReferenceBookId ?? currentActiveBookId) {
+        const key = bookId === null || bookId === undefined ? '' : String(bookId);
+        const remembered = key ? tiktekUrlsByBook.get(key) : '';
+        if (remembered) return remembered;
+        try {
+            const saved = key ? validExternalUrl(localStorage.getItem(`books-tiktek-url-v1:${key}`)) : '';
+            if (saved) { tiktekUrlsByBook.set(key, saved); return saved; }
+        } catch {}
+        return tiktekDefaultsByCatalog[getBookCatalogId()] || referenceDocuments.tiktek.url;
+    }
+    function captureTiktekUrl() {
+        if (currentReferenceKind !== 'tiktek') return;
+        const frame = getTiktekFrame(currentReferenceBookId);
+        let url = frame.dataset.requestedUrl || frame.src;
+        // A cross-origin iframe cannot disclose a URL it navigated to internally.
+        // This succeeds only if Tiktek later serves a same-origin page, but keeps the
+        // known launch URL in all ordinary cases.
+        try { url = frame.contentWindow?.location?.href || url; } catch {}
+        saveTiktekUrlForBook(currentReferenceBookId, url);
+    }
+    function getTiktekFrame(bookId) {
+        const key = String(bookId ?? 'library');
+        let frame = tiktekFramesByBook.get(key);
+        if (frame?.isConnected) return frame;
+        const host = document.getElementById('tiktek-frame-host');
+        if (!frame && !tiktekFramesByBook.size) frame = document.getElementById('tiktek-frame');
+        if (!frame) {
+            frame = document.createElement('iframe');
+            frame.className = 'tiktek-frame'; frame.title = 'Tiktek';
+            frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-same-origin');
+            frame.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin');
+        }
+        frame.dataset.bookKey = key;
+        tiktekFramesByBook.set(key, frame);
+        if (!frame.isConnected) host.appendChild(frame);
+        return frame;
+    }
+    function saveReferenceState(kind = currentReferenceKind, bookId = currentReferenceBookId ?? currentActiveBookId) {
         if (!kind) return;
-        const saved = getReferenceState(kind);
-        saved.zoom = getReferenceZoom(kind);
-        if (kind !== 'tiktek' && !document.getElementById('reference-viewer').hidden) {
+        const saved = getReferenceState(kind, bookId);
+        saved.zoom = getReferenceZoom(kind, bookId);
+        const entry = currentReferenceEntry;
+        if (entry?.type !== 'iframe' && !document.getElementById('reference-viewer').hidden) {
             const host = document.getElementById('reference-pages');
+            saved.page = nearestReferencePage(host);
             saved.scrollTop = host.scrollTop;
             saved.scrollRatio = host.scrollHeight > host.clientHeight ? host.scrollTop / (host.scrollHeight - host.clientHeight) : 0;
         }
-        try { localStorage.setItem(referenceStateKey(kind), JSON.stringify(saved)); } catch {}
+        if (kind === 'tiktek') captureTiktekUrl();
+        try { localStorage.setItem(referenceStateKey(kind, bookId), JSON.stringify(saved)); } catch {}
     }
-    function restoreReferencePosition(kind) {
+    function restoreReferencePosition(kind, bookId = currentReferenceBookId) {
         const host = document.getElementById('reference-pages');
-        const state = getReferenceState(kind);
-        requestAnimationFrame(() => {
+        const state = getReferenceState(kind, bookId);
+        requestAnimationFrame(() => requestAnimationFrame(() => {
             if (currentReferenceKind !== kind || document.getElementById('reference-viewer').hidden) return;
+            const page = Math.max(1, Number.parseInt(state.page, 10) || 1);
+            const target = host.querySelector(`.reference-page-wrap[data-page="${page}"]`);
+            if (target) { target.scrollIntoView({ block: 'start', behavior: 'auto' }); return; }
             const maxScroll = Math.max(0, host.scrollHeight - host.clientHeight);
             const ratio = Number(state.scrollRatio);
             host.scrollTop = Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) * maxScroll : Math.max(0, Number(state.scrollTop) || 0);
-        });
+        }));
     }
     function applyTiktekZoom() {
         const host = document.getElementById('tiktek-frame-host');
-        const frame = document.getElementById('tiktek-frame');
-        const scale = getReferenceZoom('tiktek');
+        const frame = getTiktekFrame(currentReferenceBookId);
+        const scale = getReferenceZoom(currentReferenceKind || 'tiktek');
         host.style.setProperty('--tiktek-scale', String(scale));
         host.style.overflow = scale > 1 ? 'auto' : 'hidden';
         frame.style.width = `${100 / scale}%`;
@@ -2283,51 +2614,78 @@
         frame.style.transform = `scale(${scale})`;
         document.getElementById('reference-zoom-label').textContent = `${Math.round(scale * 100)}%`;
     }
-    async function toggleReferencePdf(kind) {
-        const entry = referenceDocuments[kind]; if (!entry) return;
+    function releaseReferencePdf(kind) {
+        const pdf = referencePdfCache.get(kind);
+        referencePdfCache.delete(kind);
+        if (!pdf) return;
+        try { pdf.cleanup?.(); } catch {}
+        try { Promise.resolve(pdf.destroy?.()).catch(() => {}); } catch {}
+    }
+    function releaseAllReferencePdfs() {
+        [...referencePdfCache.keys()].forEach(releaseReferencePdf);
+    }
+    async function toggleReferencePdf(reference) {
+        const entry = normalizeReferenceEntry(reference); if (!entry) return;
         const viewer = document.getElementById('reference-viewer');
-        if (currentReferenceKind === kind && !viewer.hidden) { closeReferencePdf(); return; }
+        if (currentReferenceKind === entry.id && !viewer.hidden) { closeReferencePdf(); return; }
         clearTimeout(referenceSaveTimer);
-        if (!viewer.hidden) closeReferencePdf();
-        else if (currentReferenceKind) saveReferenceState(currentReferenceKind);
+        if (!viewer.hidden || currentReferenceKind) closeReferencePdf();
         const token = ++referenceLoadToken;
-        referenceObserver?.disconnect();
+        referenceObserver?.disconnect(); referenceObserver = null;
         document.getElementById('page-thumbnails').hidden = true;
         clearThumbnails();
         document.querySelectorAll('.reader-popover').forEach(panel => { panel.hidden = true; });
         applyTocSidebar(false);
-        viewer.hidden = false; currentReferenceKind = kind;
+        currentReferenceKind = entry.id;
+        currentReferenceEntry = entry;
+        currentReferenceBookId = currentActiveBookId;
+        viewer.hidden = false;
         document.getElementById('reader-modal').classList.add('reference-open');
         document.getElementById('reference-viewer-title').textContent = entry.title;
-        document.getElementById('reference-viewer-status').textContent = kind === 'tiktek' ? 'פותחים את Tiktek בחלונית…' : 'טוען מסמך…';
+        document.getElementById('reference-viewer-status').textContent = entry.type === 'iframe' ? `פותחים את ${entry.title} בחלונית…` : 'טוען מסמך…';
         const pages = document.getElementById('reference-pages');
-        const frame = document.getElementById('tiktek-frame');
-        pages.hidden = kind === 'tiktek';
-        document.getElementById('tiktek-frame-host').hidden = kind !== 'tiktek';
-        frame.hidden = false;
+        const frameHost = document.getElementById('tiktek-frame-host');
+        const frame = entry.type === 'iframe' && (entry.id === 'tiktek' || entry.isTiktek)
+            ? getTiktekFrame(currentReferenceBookId)
+            : document.getElementById('tiktek-frame');
+        pages.hidden = entry.type === 'iframe';
+        frameHost.hidden = entry.type !== 'iframe';
+        frame.hidden = entry.type !== 'iframe';
         document.getElementById('reference-zoom-out').hidden = buttonConfig('reader', 'reader-reference-zoom-out').visible === false;
         document.getElementById('reference-zoom-in').hidden = buttonConfig('reader', 'reader-reference-zoom-in').visible === false;
-        document.getElementById('reference-zoom-label').textContent = `${Math.round(getReferenceZoom(kind) * 100)}%`;
+        document.getElementById('reference-zoom-label').textContent = `${Math.round(getReferenceZoom(entry.id) * 100)}%`;
         clearReferencePages();
-        if (kind === 'tiktek') {
+        if (entry.type === 'iframe') {
+            const isTiktek = entry.id === 'tiktek' || entry.isTiktek;
+            const destination = isTiktek ? tiktekUrlForBook(currentReferenceBookId) : entry.url;
+            if (isTiktek) saveTiktekUrlForBook(currentReferenceBookId, destination);
             applyTiktekZoom();
-            frame.onload = () => { if (token === referenceLoadToken && currentReferenceKind === 'tiktek') document.getElementById('reference-viewer-status').textContent = 'Tiktek · גללו והשתמשו באתר כאן.'; };
-            if (frame.dataset.loaded !== 'true') { frame.src = entry.url; frame.dataset.loaded = 'true'; }
-            else document.getElementById('reference-viewer-status').textContent = 'Tiktek · גללו והשתמשו באתר כאן.';
+            [...frameHost.querySelectorAll('.tiktek-frame')].forEach(candidate => { candidate.hidden = candidate !== frame; });
+            frame.onload = () => {
+                if (token !== referenceLoadToken || currentReferenceKind !== entry.id) return;
+                if (isTiktek) captureTiktekUrl();
+                document.getElementById('reference-viewer-status').textContent = `${entry.title} · גללו והשתמשו באתר כאן.`;
+            };
+            if (frame.dataset.loaded !== 'true') {
+                frame.dataset.requestedUrl = destination;
+                frame.src = destination;
+                frame.dataset.loaded = 'true';
+            } else document.getElementById('reference-viewer-status').textContent = `${entry.title} · גללו והשתמשו באתר כאן.`;
             return;
         }
         try {
             if (!window.pdfjsLib) throw new Error('רכיב הצגת PDF לא נטען.');
-            let pdf = referencePdfCache.get(kind);
-            if (!pdf) {
-                const url = new URL(`books/${encodeURIComponent(entry.file)}`, document.baseURI).href;
-                pdf = await pdfjsLib.getDocument({ url }).promise;
-                referencePdfCache.set(kind, pdf);
+            const url = new URL(`books/${encodeURIComponent(entry.file)}`, document.baseURI).href;
+            const pdf = await pdfjsLib.getDocument({ url }).promise;
+            if (token !== referenceLoadToken || currentReferenceKind !== entry.id) {
+                try { pdf.cleanup?.(); } catch {}
+                try { Promise.resolve(pdf.destroy?.()).catch(() => {}); } catch {}
+                return;
             }
-            if (token !== referenceLoadToken) return;
+            referencePdfCache.set(entry.id, pdf);
             document.getElementById('reference-viewer-status').textContent = `${pdf.numPages} עמודים`;
-            queueReferencePages(pdf, token);
-            restoreReferencePosition(kind);
+            queueReferencePages(pdf, token, entry.id);
+            restoreReferencePosition(entry.id, currentReferenceBookId);
         } catch (error) {
             if (token === referenceLoadToken) document.getElementById('reference-viewer-status').textContent = error.message || `לא ניתן לטעון את ${entry.file}.`;
         }
@@ -2338,7 +2696,7 @@
         host?.querySelectorAll('canvas').forEach(canvas => { canvas.width = 0; canvas.height = 0; });
         host?.replaceChildren();
     }
-    function queueReferencePages(pdf, token) {
+    function queueReferencePages(pdf, token, kind = currentReferenceKind) {
         const host = document.getElementById('reference-pages');
         const fragment = document.createDocumentFragment();
         for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
@@ -2355,7 +2713,7 @@
                     const wrap = item.target;
                     if (item.isIntersecting) {
                         wrap.dataset.wanted = 'true';
-                        if (wrap.dataset.rendered !== 'true') renderReferencePage(pdf, Number(wrap.dataset.page), wrap, token);
+                        if (wrap.dataset.rendered !== 'true') renderReferencePage(pdf, Number(wrap.dataset.page), wrap, token, kind);
                         return;
                     }
                     wrap.dataset.wanted = 'false';
@@ -2366,18 +2724,18 @@
                 });
             }, { root: host, rootMargin: '500px 0px' });
             host.querySelectorAll('.reference-page-wrap').forEach(wrap => referenceObserver.observe(wrap));
-        } else host.querySelectorAll('.reference-page-wrap').forEach(wrap => { wrap.dataset.wanted = 'true'; renderReferencePage(pdf, Number(wrap.dataset.page), wrap, token); });
+        } else host.querySelectorAll('.reference-page-wrap').forEach(wrap => { wrap.dataset.wanted = 'true'; renderReferencePage(pdf, Number(wrap.dataset.page), wrap, token, kind); });
     }
-    async function renderReferencePage(pdf, pageNumber, host, token) {
-        if (host.dataset.rendered === 'true' || referenceRenderTasks.has(host) || token !== referenceLoadToken || host.dataset.wanted !== 'true') return;
+    async function renderReferencePage(pdf, pageNumber, host, token, kind = currentReferenceKind) {
+        if (host.dataset.rendered === 'true' || referenceRenderTasks.has(host) || token !== referenceLoadToken || currentReferenceKind !== kind || host.dataset.wanted !== 'true') return;
         host.dataset.rendered = 'true';
         let canvas = null;
         let task = null;
         try {
             const page = await pdf.getPage(pageNumber);
-            if (token !== referenceLoadToken || host.dataset.wanted !== 'true') { host.dataset.rendered = 'false'; return; }
+            if (token !== referenceLoadToken || currentReferenceKind !== kind || host.dataset.wanted !== 'true') { host.dataset.rendered = 'false'; return; }
             const available = Math.max(180, document.getElementById('reference-pages').clientWidth - 40);
-                    const scale = Math.min(1.25, available / page.getViewport({ scale: 1 }).width) * getReferenceZoom(currentReferenceKind);
+            const scale = Math.min(1.25, available / page.getViewport({ scale: 1 }).width) * getReferenceZoom(kind);
             const displayScale = Math.max(.001, scale);
             const viewport = page.getViewport({ scale: Math.min(displayScale, 3.5) });
             const displayViewport = page.getViewport({ scale: displayScale });
@@ -2387,57 +2745,68 @@
             task = page.render({ canvasContext: canvas.getContext('2d', { alpha: false }), viewport });
             referenceRenderTasks.set(host, task);
             await task.promise;
-            if (token !== referenceLoadToken || host.dataset.wanted !== 'true') { canvas.width = 0; canvas.height = 0; host.dataset.rendered = 'false'; return; }
+            if (token !== referenceLoadToken || currentReferenceKind !== kind || host.dataset.wanted !== 'true') { canvas.width = 0; canvas.height = 0; host.dataset.rendered = 'false'; return; }
             host.classList.remove('is-loading'); host.replaceChildren(canvas);
             canvas = null;
         } catch (error) {
-            if (token === referenceLoadToken && host.dataset.wanted === 'true' && error?.name !== 'RenderingCancelledException') { host.classList.remove('is-loading'); host.textContent = `לא ניתן להציג את עמוד ${pageNumber}.`; }
+            if (token === referenceLoadToken && currentReferenceKind === kind && host.dataset.wanted === 'true' && error?.name !== 'RenderingCancelledException') { host.classList.remove('is-loading'); host.textContent = `לא ניתן להציג את עמוד ${pageNumber}.`; }
             else host.dataset.rendered = 'false';
         } finally {
             if (canvas) { canvas.width = 0; canvas.height = 0; }
             if (referenceRenderTasks.get(host) === task) referenceRenderTasks.delete(host);
-            if (token === referenceLoadToken && host.dataset.wanted === 'true' && host.dataset.rendered !== 'true') requestAnimationFrame(() => renderReferencePage(pdf, pageNumber, host, token));
+            if (token === referenceLoadToken && currentReferenceKind === kind && host.dataset.wanted === 'true' && host.dataset.rendered !== 'true') requestAnimationFrame(() => renderReferencePage(pdf, pageNumber, host, token, kind));
         }
     }
     function zoomReference(direction) {
-        if (!currentReferenceKind) return;
-        if (currentReferenceKind === 'tiktek') {
-            const current = getReferenceZoom('tiktek');
-            const next = Math.max(.25, Math.min(4, current * (direction > 0 ? 1.16 : 1 / 1.16)));
-            referenceZoomLevels.set('tiktek', next);
-            applyTiktekZoom(); saveReferenceState('tiktek');
-            return;
-        }
+        if (!currentReferenceKind || !currentReferenceEntry) return;
         const kind = currentReferenceKind;
-        const host = document.getElementById('reference-pages');
-        const ratio = host.scrollHeight > host.clientHeight ? host.scrollTop / (host.scrollHeight - host.clientHeight) : 0;
         const current = getReferenceZoom(kind);
-        const next = Math.max(.001, Math.min(1000000, current * (direction > 0 ? 1.16 : 1 / 1.16)));
-        referenceZoomLevels.set(kind, next);
-        saveReferenceState(kind);
+        const next = currentReferenceEntry.type === 'iframe'
+            ? Math.max(.25, Math.min(4, current * (direction > 0 ? 1.16 : 1 / 1.16)))
+            : Math.max(.001, Math.min(1000000, current * (direction > 0 ? 1.16 : 1 / 1.16)));
+        setReferenceZoom(kind, next);
         document.getElementById('reference-zoom-label').textContent = `${Math.round(next * 100)}%`;
+        if (currentReferenceEntry.type === 'iframe') { applyTiktekZoom(); saveReferenceState(kind); return; }
+        const host = document.getElementById('reference-pages');
+        const savedPage = nearestReferencePage(host);
+        saveReferenceState(kind);
         const pdf = referencePdfCache.get(kind);
         if (pdf) {
             const token = ++referenceLoadToken;
-            queueReferencePages(pdf, token);
+            queueReferencePages(pdf, token, kind);
             requestAnimationFrame(() => {
                 if (currentReferenceKind !== kind || token !== referenceLoadToken) return;
-                host.scrollTop = ratio * Math.max(0, host.scrollHeight - host.clientHeight);
+                const page = host.querySelector(`.reference-page-wrap[data-page="${savedPage}"]`);
+                page?.scrollIntoView({ block: 'start', behavior: 'auto' });
                 saveReferenceState(kind);
             });
         }
     }
     function closeReferencePdf() {
+        const closingKind = currentReferenceKind;
+        const closingEntry = currentReferenceEntry;
+        const closingBookId = currentReferenceBookId;
         clearTimeout(referenceSaveTimer);
-        saveReferenceState();
-        referenceLoadToken++; referenceObserver?.disconnect();
+        if (closingKind) saveReferenceState(closingKind, closingBookId);
+        referenceLoadToken++;
+        referenceObserver?.disconnect(); referenceObserver = null;
+        clearReferencePages();
+        if (closingEntry?.type === 'iframe') {
+            if (closingKind === 'tiktek') captureTiktekUrl();
+            // Keep each book's Tiktek page alive while its pane is hidden. This
+            // preserves its in-site route and state when the user reopens it.
+        }
+        // Fully release every PDF.js document/worker when its side pane closes.
+        releaseAllReferencePdfs();
         document.getElementById('reference-viewer').hidden = true;
         document.getElementById('reader-modal').classList.remove('reference-open');
         document.getElementById('reference-pages').hidden = false;
-        clearReferencePages();
         document.getElementById('reference-zoom-out').hidden = buttonConfig('reader', 'reader-reference-zoom-out').visible === false;
         document.getElementById('reference-zoom-in').hidden = buttonConfig('reader', 'reader-reference-zoom-in').visible === false;
         document.getElementById('tiktek-frame-host').hidden = true;
+        currentReferenceKind = null;
+        currentReferenceEntry = null;
+        currentReferenceBookId = null;
     }
     async function downloadCurrentPage() {
         if (!currentPdf) { showToast('פתחו ספר PDF כדי להוריד את העמוד הנוכחי.'); return; }
@@ -2957,6 +3326,22 @@
     }
     function setupEnhancements() {
         setupThemeBuilderModal();
+        let pendingInstallPrompt = null;
+        const installButton = document.getElementById('pwa-install-button');
+        window.addEventListener('beforeinstallprompt', event => {
+            event.preventDefault(); pendingInstallPrompt = event;
+            if (installButton) installButton.hidden = false;
+        });
+        installButton?.addEventListener('click', async () => {
+            if (!pendingInstallPrompt) return;
+            pendingInstallPrompt.prompt();
+            await pendingInstallPrompt.userChoice;
+            pendingInstallPrompt = null; installButton.hidden = true;
+        });
+        window.addEventListener('appinstalled', () => { if (installButton) installButton.hidden = true; });
+        if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+            navigator.serviceWorker.register(new URL('service-worker.js', document.baseURI)).catch(() => {});
+        }
         if (!window.__booksLocalizedDialogs) {
             const nativeConfirm = window.confirm.bind(window);
             const nativePrompt = window.prompt.bind(window);
@@ -2975,11 +3360,7 @@
         document.getElementById('profile-name').textContent = preferences.username || 'your-username';
         document.getElementById('user-avatar').textContent = preferences.avatar || '📚';
         applyAccentColor(preferences.accent || '#5368d9');
-        applyAppearance(preferences.appearance || 'system');
         applyUiScale(preferences.uiScale || 'normal');
-        window.matchMedia?.('(prefers-color-scheme: dark)').addEventListener?.('change', () => {
-            if ((preferences.appearance || 'system') === 'system') applyAppearance('system');
-        });
         document.body.classList.toggle('reduce-motion-enabled', Boolean(preferences.reduceMotion));
         syncSettingsControls();
         applyLanguage(preferences.language || 'he');
@@ -2993,13 +3374,14 @@
         document.getElementById('library-density').addEventListener('change', event => setLibraryDensity(event.target.value));
         document.getElementById('settings-density').addEventListener('change', event => setLibraryDensity(event.target.value));
         document.getElementById('accent-setting').addEventListener('input', event => applyAccentColor(event.target.value));
-        document.getElementById('settings-appearance').addEventListener('change', event => { preferences.appearance = event.target.value; applyAppearance(preferences.appearance); savePreferences(); });
         document.getElementById('settings-text-size').addEventListener('change', event => { preferences.uiScale = event.target.value; applyUiScale(preferences.uiScale); savePreferences(); });
         document.getElementById('settings-progress').addEventListener('change', event => { preferences.showProgress = event.target.checked; savePreferences(); renderLibrary(); });
         document.getElementById('settings-continue').addEventListener('change', event => { preferences.showContinue = event.target.checked; savePreferences(); renderLibrary(); });
         document.getElementById('settings-reduce-motion').addEventListener('change', event => { preferences.reduceMotion = event.target.checked; document.body.classList.toggle('reduce-motion-enabled', preferences.reduceMotion); savePreferences(); });
         document.getElementById('language-setting').addEventListener('change', event => { preferences.language = event.target.value === 'en' ? 'en' : 'he'; savePreferences(); applyLanguage(preferences.language); });
         document.getElementById('button-editor-area').addEventListener('change', renderButtonEditor);
+        ['custom-button-type', 'custom-button-location'].forEach(id => document.getElementById(id)?.addEventListener('change', syncCustomButtonCreator));
+        syncCustomButtonCreator();
         document.getElementById('wallpaper-select').addEventListener('change', event => {
             const value = event.target.value;
             pendingWallpaperAssetId = value.startsWith('asset:') ? value.slice(6) : '';
@@ -3101,6 +3483,7 @@
     window.openRenameModal = openRenameModal;
     window.closeRenameModal = closeRenameModal;
     window.createButtonsFromCode = createButtonsFromCode;
+    window.createCustomButton = createCustomButton;
     window.openThemeBuilder = openThemeBuilder;
     window.closeThemeBuilder = closeThemeBuilder;
     window.applyLanguage = applyLanguage;
