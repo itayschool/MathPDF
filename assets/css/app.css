@@ -1,29 +1,18 @@
 :root {
-            color-scheme: normal;
-            --surface: #f4f6fb;
-            --surface-container: #ffffff;
-            --surface-soft: #edf1f8;
-            --ink: #1c2433;
-            --ink-muted: #687386;
-            --outline: #dce2ed;
-            --primary: #5368d9;
-            --primary-hover: #4054c7;
-            --primary-soft: #e9edff;
             --danger: #b83242;
-            --shadow: 0 16px 44px rgba(30, 42, 73, .09);
             --radius-xl: 30px;
             --radius-lg: 22px;
             --radius-md: 16px;
-            --focus: 0 0 0 3px rgba(83, 104, 217, .24);
+            --focus: 0 0 0 3px color-mix(in srgb, var(--primary) 24%, transparent);
         }
 
         *, *::before, *::after { box-sizing: border-box; }
-        html { min-width: 320px; min-height: 100%; background: var(--surface); }
+        html { min-width: 320px; min-height: 100%; background: var(--surface, transparent); }
         body {
             min-height: 100vh;
             margin: 0;
             color: var(--ink);
-            background: var(--surface);
+            background: transparent;
             font-family: "Segoe UI Variable", "Segoe UI", "Noto Sans Hebrew", Arial, sans-serif;
             -webkit-font-smoothing: antialiased;
         }
@@ -345,23 +334,7 @@
         body.reduce-motion-enabled *, body.reduce-motion-enabled *::before, body.reduce-motion-enabled *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 
         /* Final responsive polish: keep controls legible and panels inside the viewport. */
-        :root {
-            --surface: #f5f7fc;
-            --surface-container: #fff;
-            --surface-soft: #edf1f8;
-            --ink: #1b2435;
-            --ink-muted: #69758b;
-            --outline: #dfe5ef;
-            --shadow: 0 18px 52px rgba(31, 43, 73, .09);
-        }
         html { min-width: 280px; scroll-padding-top: 90px; }
-        body {
-            background:
-                radial-gradient(ellipse at 92% -8%, color-mix(in srgb, var(--primary) 15%, transparent), transparent 38rem),
-                radial-gradient(ellipse at 0% 42%, rgba(202, 219, 255, .45), transparent 34rem),
-                linear-gradient(180deg, #f8f9fd 0%, var(--surface) 56%, #f0f3fa 100%);
-            background-attachment: fixed;
-        }
         .header {
             min-height: 74px;
             padding-inline: clamp(16px, 4vw, 56px);
@@ -888,7 +861,6 @@
         .theme-builder-close { position: sticky; z-index: 2; top: 0; float: inline-end; display: grid; place-items: center; width: 38px; height: 38px; margin: -8px -8px 0 8px; color: var(--ink); border: 1px solid var(--outline); border-radius: 12px; background: var(--surface-container); font-size: 1.35rem; cursor: pointer; }
         .theme-builder-dialog .theme-builder-card h2 { padding-inline-end: 42px; }
         body[data-library-theme] { color: var(--ink); background-color: var(--surface); }
-        body[data-library-theme] { background-position: center; background-size: cover; background-attachment: fixed; }
         body[data-library-theme] .header { color: var(--ink); border-color: var(--outline); background: color-mix(in srgb, var(--surface-container) 88%, transparent); }
         body[data-library-theme] .shelf-panel,
         body[data-library-theme] .settings-card { color: var(--ink); border-color: var(--outline); background: color-mix(in srgb, var(--surface-container) 92%, transparent); }

@@ -1868,10 +1868,10 @@
         const background = validThemeColor(theme.background || theme.bg, '#11141d');
         const toolbar = validThemeColor(theme.toolbar || theme.card, '#202633');
         const accent = validThemeColor(theme.accent, '#7b8cf2');
-        const text = validThemeColor(theme.text, colorLuminance(background) < .43 ? '#f4f6fb' : '#20283a');
+        const text = validThemeColor(theme.text, colorLuminance(background) < .43 ? '#ffffff' : '#20283a');
         const body = document.body;
-        delete body.dataset.uiMode;
         body.dataset.libraryTheme = theme.id || 'custom';
+        document.documentElement.style.setProperty('--surface', background);
         body.style.setProperty('--surface', background);
         body.style.setProperty('--surface-container', toolbar);
         body.style.setProperty('--surface-soft', `color-mix(in srgb, ${toolbar} 72%, ${background})`);
@@ -1882,14 +1882,7 @@
         body.style.setProperty('--primary-hover', `color-mix(in srgb, ${accent} 78%, ${text})`);
         body.style.setProperty('--primary-soft', `color-mix(in srgb, ${accent} 16%, ${background})`);
         body.style.setProperty('--shadow', colorLuminance(background) < .43 ? '0 18px 48px rgba(0,0,0,.28)' : '0 16px 44px rgba(30,42,73,.09)');
-        body.style.colorScheme = colorLuminance(background) < .43 ? 'dark' : 'light';
-        document.documentElement.style.colorScheme = body.style.colorScheme;
-        document.querySelector('meta[name="theme-color"]')?.setAttribute('content', background);
-        let wallpaper = theme.wallpaperUrl || '';
-        if (!wallpaper && theme.wallpaperAssetId) wallpaper = await getLocalAssetUrl(theme.wallpaperAssetId);
-        const safeUrl = safeWallpaperUrl(wallpaper);
-        if (safeUrl) body.style.backgroundImage = `url(${JSON.stringify(safeUrl)})`;
-        else body.style.removeProperty('background-image');
+        body.style.removeProperty('background-image');
     }
     async function applyCustomReaderTheme(theme) {
         const modal = document.getElementById('reader-modal');
